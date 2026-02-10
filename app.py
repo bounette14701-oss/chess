@@ -1,99 +1,121 @@
-from fasthtml.common import *
+import streamlit as st
+import streamlit.components.v1 as components
 import chess
 import chess.engine
 import os
 import shutil
 
-# --- LOGIQUE DU MOTEUR ---
-def get_stockfish():
-    # Cherche stockfish dans le système
-    return shutil.which("stockfish") or "/usr/games/stockfish"
+# --- CONFIGURATION ---
+st.set_page_config(page_title="ProChess Cloud", layout="wide", page_icon="♟️")
 
-# --- INITIALISATION ---
-app, rt = fast_app(
-    hdrs=(
-        Link(rel="stylesheet", href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css"),
-        Script(src="https://code.jquery.com/jquery-3.5.1.min.js"),
-        Script(src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"),
-        Script(src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"),
-    )
-)
+# Design sombre inspiré de Lichess
+st.markdown("""
+    <style>
+    .stApp { background-color: #161512; color: #bababa; }
+    iframe { border-radius: 8px; border: 2px solid #3c3c3c !important; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# État global simplifié (pour une démo mono-utilisateur)
-# Dans une vraie app, on utiliserait des sessions
-game_state = {"board": chess.Board(), "difficulty": 5}
-
-@rt("/")
-def get():
-    return Titled("ProChess FastHTML",
-        Container(
-            H1("♟️ ProChess Engine"),
-            Div(id="board", style="width: 400px; margin: auto;"),
-            Div(id="status", style="margin-top: 20px; text-align: center; font-weight: bold;"),
-            
-            # Script de contrôle pour le Drag & Drop
-            Script(f"""
-                var board = null;
-                var game = new Chess('{game_state['board'].fen()}');
-
-                function onDrop(source, target) {{
-                    var move = game.move({{ from: source, to: target, promotion: 'q' }});
-                    if (move === null) return 'snapback';
-
-                    // Envoi du coup au serveur Python via HTMX (fetch) sans recharger la page
-                    fetch(`/move?uci=${{source + target}}`)
-                        .then(response => response.json())
-                        .then(data => {{
-                            board.position(data.fen);
-                            document.getElementById('status').innerText = data.status;
-                        }});
-                }}
-
-                board = Chessboard('board', {{
-                    draggable: true,
-                    position: '{game_state['board'].fen()}',
-                    onDrop: onDrop,
-                    pieceTheme: 'https://chessboardjs.com/img/chesspieces/wikipedia/{{piece}}.png'
-                }});
-            """),
-            
-            P("Mode : Contre le Bot (IA)", style="text-align: center; margin-top: 20px;"),
-            Button("Nouvelle Partie", hx_get="/reset", hx_target="body", style="display: block; margin: auto;")
-        )
-    )
-
-@rt("/move")
-def get_move(uci: str):
-    board = game_state["board"]
+# --- MOTEUR STOCKFISH ---
+def get_bot_move(board, difficulty):
+    path = "/usr/games/stockfish" if os.path.exists("/usr/games/stockfish") else shutil.which("stockfish")
+    if not path: return None
     try:
-        move = chess.Move.from_uci(uci)
-        if move in board.legal_moves:
-            board.push(move)
+        with chess.engine.SimpleEngine.popen_uci(path) as engine:
+            skill = int((difficulty - 1) * 2)
+            engine.configure({"Skill Level": skill})
+            result = engine.play(board, chess.engine.Limit(time=0.1))
+            return result.move
+    except: return None
+
+# --- INITIALISATION DE L'ÉTAT ---
+if 'board' not in st.session_state:
+    st.session_state.board = chess.Board()
+if 'move_log' not in st.session_state:
+    st.session_state.move_log = []
+
+# --- GESTION DU COUP VIA URL ---
+# Cette partie intercepte le coup envoyé par le JavaScript
+if "m" in st.query_params:
+    move_uci = st.query_params["m"]
+    st.query_params.clear() # On nettoie l'URL
+    
+    try:
+        move = chess.Move.from_uci(move_uci)
+        if move in st.session_state.board.legal_moves:
+            # Coup du Joueur
+            st.session_state.board.push(move)
+            st.session_state.move_log.append(f"Joueur: {move_uci}")
             
-            # Réponse de l'IA
-            if not board.is_game_over():
-                path = get_stockfish()
-                try:
-                    with chess.engine.SimpleEngine.popen_uci(path) as engine:
-                        engine.configure({"Skill Level": (game_state["difficulty"]-1)*2})
-                        result = engine.play(board, chess.engine.Limit(time=0.1))
-                        board.push(result.move)
-                except:
-                    # Fallback si pas de stockfish
-                    import random
-                    board.push(random.choice(list(board.legal_moves)))
+            # Coup du Bot immédiat
+            if not st.session_state.board.is_game_over():
+                bot_move = get_bot_move(st.session_state.board, st.session_state.get('diff', 5))
+                if bot_move:
+                    st.session_state.board.push(bot_move)
+                    st.session_state.move_log.append(f"Bot: {bot_move.uci()}")
+            st.rerun()
+    except: pass
 
-            status = "À vous de jouer"
-            if board.is_checkmate(): status = "Mat !"
-            elif board.is_check(): status = "Échec !"
+# --- COMPOSANT ÉCHIQUIER INTERACTIF ---
+def chessboard_component(fen):
+    # Ce script JS crée l'échequier et renvoie le coup à Streamlit via l'URL
+    js_code = f"""
+    <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
+    <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+    <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
+    
+    <div id="board" style="width: 450px; margin: auto;"></div>
+    
+    <script>
+        var board = null;
+        var game = new Chess('{fen}');
 
-            return {"fen": board.fen(), "status": status}
-    except:
-        return {"fen": board.fen(), "status": "Coup invalide"}
+        function onDrop (source, target) {{
+            var move = game.move({{ from: source, to: target, promotion: 'q' }});
+            if (move === null) return 'snapback';
 
-@rt("/reset")
-def get_reset():
-    game_state["board"] = chess.Board()
-    return RedirectResponse("/")
+            // PONT MAGIQUE : On envoie le coup à l'application parente
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('m', source + target);
+            window.parent.location.href = url.href;
+        }}
 
-serve()
+        board = Chessboard('board', {{
+            draggable: true,
+            position: '{fen}',
+            onDrop: onDrop,
+            pieceTheme: 'https://chessboardjs.com/img/chesspieces/wikipedia/{{piece}}.png'
+        }});
+    </script>
+    """
+    return components.html(js_code, height=500)
+
+# --- INTERFACE ---
+col_board, col_side = st.columns([2, 1])
+
+with col_side:
+    st.title("♟️ ProChess")
+    st.session_state.diff = st.slider("Difficulté Stockfish", 1, 10, 5)
+    
+    if st.button("🔄 Nouvelle Partie"):
+        st.session_state.board = chess.Board()
+        st.session_state.move_log = []
+        st.query_params.clear()
+        st.rerun()
+
+    st.subheader("Historique")
+    for m in st.session_state.move_log[-8:]:
+        st.caption(m)
+
+with col_board:
+    # On affiche l'échiquier
+    chessboard_component(st.session_state.board.fen())
+    
+    # Affichage du statut sous le plateau
+    if st.session_state.board.is_checkmate():
+        st.error("MAT ! La partie est terminée.")
+    elif st.session_state.board.is_check():
+        st.warning("ÉCHEC AU ROI")
+    else:
+        st.info("Faites glisser une pièce pour jouer.")
