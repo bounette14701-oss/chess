@@ -8,13 +8,54 @@ import shutil
 # --- CONFIGURATION ---
 st.set_page_config(page_title="ProChess Cloud", layout="wide", page_icon="♟️")
 
-# --- RECHERCHE STOCKFISH ---
+# CSS pour un look "Dark Mode" Lichess
+st.markdown("""
+    <style>
+    .stApp { background-color: #161512; color: #bababa; }
+    iframe { border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- LOGIQUE DU MOTEUR STOCKFISH ---
 def get_stockfish_path():
-    # Sur Streamlit Cloud, le binaire est ici :
     cloud_path = "/usr/games/stockfish"
-    if os.path.exists(cloud_path):
-        return cloud_path
-    return shutil.which("stockfish")
+    return cloud_path if os.path.exists(cloud_path) else shutil.which("stockfish")
+
+def get_bot_move(board, difficulty):
+    path = get_stockfish_path()
+    if not path: return None
+    try:
+        with chess.engine.SimpleEngine.popen_uci(path) as engine:
+            # Skill Level 0 à 20
+            skill = int((difficulty - 1) * 2)
+            engine.configure({"Skill Level": skill})
+            # Temps de calcul limité pour la réactivité
+            result = engine.play(board, chess.engine.Limit(time=0.1, depth=difficulty+5))
+            return result.move
+    except:
+        return None
+
+# --- GESTION DU PONT JAVASCRIPT -> PYTHON ---
+# On récupère le coup depuis l'URL (ex: ?move=e2e4)
+if "move" in st.query_params:
+    move_uci = st.query_params["move"]
+    # Nettoyage immédiat de l'URL pour éviter de rejouer le coup au prochain refresh
+    st.query_params.clear()
+    
+    try:
+        move = chess.Move.from_uci(move_uci)
+        if 'board' in st.session_state and move in st.session_state.board.legal_moves:
+            st.session_state.board.push(move)
+            st.session_state.move_log.append(f"Joueur: {move_uci}")
+            
+            # Tour de l'IA si mode Bot activé
+            if st.session_state.get('mode') == "Bot" and not st.session_state.board.is_game_over():
+                bot_move = get_bot_move(st.session_state.board, st.session_state.get('diff', 5))
+                if bot_move:
+                    st.session_state.board.push(bot_move)
+                    st.session_state.move_log.append(f"IA: {bot_move.uci()}")
+    except:
+        pass
 
 # --- INITIALISATION DE L'ÉTAT ---
 if 'board' not in st.session_state:
@@ -22,35 +63,17 @@ if 'board' not in st.session_state:
 if 'move_log' not in st.session_state:
     st.session_state.move_log = []
 
-# --- LOGIQUE DU MOTEUR ---
-def get_bot_move(board, difficulty):
-    path = get_stockfish_path()
-    if not path:
-        return None
-    try:
-        # On limite le temps de calcul pour éviter de surcharger le CPU du cloud
-        with chess.engine.SimpleEngine.popen_uci(path) as engine:
-            skill = int((difficulty - 1) * 2)
-            engine.configure({"Skill Level": skill})
-            result = engine.play(board, chess.engine.Limit(time=0.1))
-            return result.move
-    except:
-        return None
-
-# --- COMPOSANT ÉCHIQUIER (JS) ---
-def interactive_board(fen):
-    # On utilise Chessboard.js via CDN pour le drag and drop visuel
+# --- COMPOSANT ÉCHIQUIER INTERACTIF ---
+def render_interactive_board(fen):
+    """Génère l'échequier avec Chessboard.js et le pont de données."""
     board_html = f"""
     <link rel="stylesheet" href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css">
     <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
     <script src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"></script>
     
-    <div id="myBoard" style="width: 450px; margin: auto;"></div>
-    <p style="text-align:center; color: #bababa; font-family: sans-serif; margin-top: 10px;">
-        Déplacez une pièce, puis copiez le coup ci-dessous (ex: e2e4)
-    </p>
-
+    <div id="myBoard" style="width: 500px; margin: auto;"></div>
+    
     <script>
         var board = null;
         var game = new Chess('{fen}');
@@ -59,9 +82,15 @@ def interactive_board(fen):
             var move = game.move({{
                 from: source,
                 to: target,
-                promotion: 'q'
+                promotion: 'q' // Promotion dame automatique pour fluidité
             }});
+
             if (move === null) return 'snapback';
+
+            // LE PONT : On recharge la page parente avec le coup dans l'URL
+            const url = new URL(window.parent.location.href);
+            url.searchParams.set('move', source + target);
+            window.parent.location.href = url.href;
         }}
 
         var config = {{
@@ -73,60 +102,40 @@ def interactive_board(fen):
         board = Chessboard('myBoard', config);
     </script>
     """
-    return components.html(board_html, height=520)
+    return components.html(board_html, height=550)
 
-# --- INTERFACE ---
-st.title("♟️ ProChess : Cloud Edition")
+# --- INTERFACE UTILISATEUR ---
+st.title("♟️ ProChess Cloud Edition")
 
 col1, col2 = st.columns([2, 1])
 
-with col1:
-    # On affiche le plateau interactif
-    interactive_board(st.session_state.board.fen())
-    
-    # Saisie du coup
-    with st.form(key="move_form"):
-        move_input = st.text_input("Entrez votre coup (ex: e2e4, g1f3) :").lower().strip()
-        submit = st.form_submit_button("Valider le mouvement")
-
-    if submit and move_input:
-        try:
-            move = chess.Move.from_uci(move_input)
-            if move in st.session_state.board.legal_moves:
-                # Joueur
-                st.session_state.board.push(move)
-                st.session_state.move_log.append(f"Vous: {move_input}")
-                
-                # Bot
-                if not st.session_state.board.is_game_over():
-                    with st.spinner("L'IA réfléchit..."):
-                        bot_move = get_bot_move(st.session_state.board, 5)
-                        if bot_move:
-                            st.session_state.board.push(bot_move)
-                            st.session_state.move_log.append(f"IA: {bot_move.uci()}")
-                st.rerun()
-            else:
-                st.error("Coup illégal pour cette position.")
-        except:
-            st.error("Format invalide. Utilisez la notation comme 'e2e4'.")
-
 with col2:
-    st.sidebar.title("Paramètres")
-    difficulty = st.sidebar.slider("Niveau IA", 1, 10, 5)
+    st.sidebar.title("Configuration")
+    st.session_state.mode = st.sidebar.selectbox("Mode de jeu", ["Bot", "Local"], index=0)
+    st.session_state.diff = st.sidebar.slider("Difficulté IA (Stockfish)", 1, 10, 5)
+    
     if st.sidebar.button("Nouvelle Partie"):
         st.session_state.board = chess.Board()
         st.session_state.move_log = []
+        st.query_params.clear()
         st.rerun()
 
     st.subheader("Analyse & Historique")
-    if st.session_state.board.is_checkmate():
+    if st.session_state.board.is_check():
+        st.error("⚠️ ÉCHEC AU ROI")
+    
+    if st.session_state.board.is_game_over():
+        st.success(f"Fin de partie ! Résultat : {st.session_state.board.result()}")
         st.balloons()
-        st.success("MAT !")
-    elif st.session_state.board.is_check():
-        st.warning("Échec !")
 
+    # Affichage des 10 derniers coups
     for m in st.session_state.move_log[-10:]:
-        st.write(m)
+        st.text(m)
+
+with col1:
+    # On affiche l'échiquier interactif
+    render_interactive_board(st.session_state.board.fen())
 
 st.divider()
-st.caption("Note : Le drag-and-drop est visuel. Pour confirmer le coup au moteur, saisissez-le dans la case texte.")
+
+st.caption("Système de coordonnées UCI utilisé par le moteur pour traiter vos déplacements.")
