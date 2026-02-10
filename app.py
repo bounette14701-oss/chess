@@ -1,72 +1,99 @@
-import reflex as rx
+from fasthtml.common import *
 import chess
 import chess.engine
-import random
+import os
+import shutil
 
-# --- LOGIQUE DU JEU (BACKEND) ---
-class State(rx.State):
-    fen: str = chess.STARTING_FEN
-    move_log: list[str] = []
-    difficulty: int = 5
+# --- LOGIQUE DU MOTEUR ---
+def get_stockfish():
+    # Cherche stockfish dans le système
+    return shutil.which("stockfish") or "/usr/games/stockfish"
 
-    def handle_move(self, move_data: dict):
-        """Appelé quand une pièce est lâchée sur le plateau"""
-        board = chess.Board(self.fen)
-        move_uci = move_data["sourceSquare"] + move_data["targetSquare"]
-        
-        try:
-            move = chess.Move.from_uci(move_uci)
-            if move in board.legal_moves:
-                board.push(move)
-                self.move_log.append(f"Joueur: {move_uci}")
-                
-                # Réponse immédiate de l'IA (Stockfish ou Random)
-                if not board.is_game_over():
-                    bot_move = random.choice(list(board.legal_moves)) # Exemple simplifié
-                    board.push(bot_move)
-                    self.move_log.append(f"IA: {bot_move.uci()}")
-                
-                self.fen = board.fen()
-        except Exception:
-            pass
+# --- INITIALISATION ---
+app, rt = fast_app(
+    hdrs=(
+        Link(rel="stylesheet", href="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.css"),
+        Script(src="https://code.jquery.com/jquery-3.5.1.min.js"),
+        Script(src="https://unpkg.com/@chrisoakman/chessboardjs@1.0.0/dist/chessboard-1.0.0.min.js"),
+        Script(src="https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.3/chess.min.js"),
+    )
+)
 
-# --- INTERFACE (FRONTEND) ---
-def index():
-    return rx.center(
-        rx.vstack(
-            rx.heading("ProChess Reflex", size="9"),
+# État global simplifié (pour une démo mono-utilisateur)
+# Dans une vraie app, on utiliserait des sessions
+game_state = {"board": chess.Board(), "difficulty": 5}
+
+@rt("/")
+def get():
+    return Titled("ProChess FastHTML",
+        Container(
+            H1("♟️ ProChess Engine"),
+            Div(id="board", style="width: 400px; margin: auto;"),
+            Div(id="status", style="margin-top: 20px; text-align: center; font-weight: bold;"),
             
-            # Ici, on peut intégrer un vrai composant React Chessboard
-            # via l'intégration facile de Reflex pour les bibliothèques JS
-            rx.box(
-                rx.html(f"<chess-board fen='{State.fen}' draggable='true'></chess-board>"),
-                width="400px",
-                height="400px",
-            ),
+            # Script de contrôle pour le Drag & Drop
+            Script(f"""
+                var board = null;
+                var game = new Chess('{game_state['board'].fen()}');
+
+                function onDrop(source, target) {{
+                    var move = game.move({{ from: source, to: target, promotion: 'q' }});
+                    if (move === null) return 'snapback';
+
+                    // Envoi du coup au serveur Python via HTMX (fetch) sans recharger la page
+                    fetch(`/move?uci=${{source + target}}`)
+                        .then(response => response.json())
+                        .then(data => {{
+                            board.position(data.fen);
+                            document.getElementById('status').innerText = data.status;
+                        }});
+                }}
+
+                board = Chessboard('board', {{
+                    draggable: true,
+                    position: '{game_state['board'].fen()}',
+                    onDrop: onDrop,
+                    pieceTheme: 'https://chessboardjs.com/img/chesspieces/wikipedia/{{piece}}.png'
+                }});
+            """),
             
-            rx.hstack(
-                rx.vstack(
-                    rx.text("Historique"),
-                    rx.list(
-                        rx.foreach(State.move_log, lambda m: rx.list_item(m))
-                    ),
-                    max_height="200px",
-                    overflow_y="auto"
-                ),
-                rx.vstack(
-                    rx.text("Difficulté IA"),
-                    rx.slider(default_value=5, min_=1, max_=10, on_change=State.set_difficulty),
-                    rx.button("Nouvelle Partie", on_click=rx.redirect("/")),
-                )
-            ),
-            padding="2em",
-            background_color="#1a1a1a",
-            border_radius="15px",
-            color="white"
-        ),
-        height="100vh",
-        background_color="#121212"
+            P("Mode : Contre le Bot (IA)", style="text-align: center; margin-top: 20px;"),
+            Button("Nouvelle Partie", hx_get="/reset", hx_target="body", style="display: block; margin: auto;")
+        )
     )
 
-app = rx.App()
-app.add_page(index)
+@rt("/move")
+def get_move(uci: str):
+    board = game_state["board"]
+    try:
+        move = chess.Move.from_uci(uci)
+        if move in board.legal_moves:
+            board.push(move)
+            
+            # Réponse de l'IA
+            if not board.is_game_over():
+                path = get_stockfish()
+                try:
+                    with chess.engine.SimpleEngine.popen_uci(path) as engine:
+                        engine.configure({"Skill Level": (game_state["difficulty"]-1)*2})
+                        result = engine.play(board, chess.engine.Limit(time=0.1))
+                        board.push(result.move)
+                except:
+                    # Fallback si pas de stockfish
+                    import random
+                    board.push(random.choice(list(board.legal_moves)))
+
+            status = "À vous de jouer"
+            if board.is_checkmate(): status = "Mat !"
+            elif board.is_check(): status = "Échec !"
+
+            return {"fen": board.fen(), "status": status}
+    except:
+        return {"fen": board.fen(), "status": "Coup invalide"}
+
+@rt("/reset")
+def get_reset():
+    game_state["board"] = chess.Board()
+    return RedirectResponse("/")
+
+serve()
